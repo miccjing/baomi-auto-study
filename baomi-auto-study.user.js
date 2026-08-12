@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         中国保密在线：2026三类课程自动学习
 // @namespace    https://github.com/HaruteRuby/baomi-auto-study
-// @version      1.0.2
-// @description  逐类完成保密教育视频；防止列表未加载时误切分类，并阻止重复打开学习标签页。
+// @version      1.0.5
+// @description  逐类完成保密教育视频；防误切分类，自动刷新处理卡顿/无法播放情况。
 // @author       HaruteRuby
 // @match        https://www.baomi.org.cn/bmCourseDetail/course*
 // @match        https://www.baomi.org.cn/bmVideo*
@@ -21,20 +21,14 @@
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, version 3 of the License.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
  */
 
 (function () {
   'use strict';
 
-  console.info('[保密网自动学习] v1.0.2 已注入');
+  console.info('[保密网自动学习] v1.0.5 已注入');
 
   const CONFIG = Object.freeze({
-    // 严格按网页显示顺序完成：一个分类全部 status2 后才进入下一个分类。
     categories: ['保密优良传统教育', '保密知识技能教育', '保密纪律教育'],
     tickMs: 1200,
     actionCooldownMs: 2800,
@@ -61,7 +55,7 @@
       try {
         return window.localStorage.getItem(key) ?? fallback;
       } catch (error) {
-        console.warn('[保密网自动学习] localStorage 不可用，改用内存状态：', error);
+        console.warn('[保密网自动学习] localStorage 不可用：', error);
         return fallback;
       }
     },
@@ -69,7 +63,7 @@
       try {
         window.localStorage.setItem(key, value);
       } catch (error) {
-        console.warn('[保密网自动学习] 无法保存状态，但不影响本次运行：', error);
+        console.warn('[保密网自动学习] 无法保存状态：', error);
       }
     },
   };
@@ -97,6 +91,7 @@
     maxProgressRatio: 0,
     lastVideoTime: 0,
     timer: 0,
+    playerWaitStartTime: 0, // 用于检测视频是否长期无法加载
   };
 
   let channel = null;
@@ -234,17 +229,17 @@
           updatePanel(`学习页已打开，等待完播：${state.currentCourse}`);
         }
         if (message.type === 'course-finished' && state.waitingForPlayer) {
-          log('收到学习页完成通知，刷新列表页。');
+          log('收到学习页完成通知，准备刷新列表页。');
           clearPlayerWait('课程已完成');
-          updatePanel('课程已完播，正在刷新服务器状态…');
-          // 原列表页不会主动刷新 status0/status2，完整重载可确保从服务器读取最新状态。
-          window.setTimeout(() => location.reload(), 2500);
+          updatePanel('课程已完播，正在刷新页面以进入下一个视频…');
+          window.setTimeout(() => location.reload(), 1500);
         }
         if (message.type === 'player-closed' && state.waitingForPlayer && !message.completed) {
           clearPlayerWait('学习页已关闭');
           state.selectedCategoryIndex = -1;
           state.completeScans = 0;
-          updatePanel('学习页已关闭但未确认完播，将重新核对课程状态。');
+          updatePanel('学习页已关闭，正在刷新页面核对状态…');
+          window.setTimeout(() => location.reload(), 1500);
         }
       });
     } catch (error) {
@@ -327,12 +322,12 @@
     state.openingSince = 0;
     state.currentCourse = '';
     state.lastActionAt = 0;
+    state.playerWaitStartTime = 0;
   }
 
   function openCourse(card) {
     if (state.waitingForPlayer) return false;
     const title = courseTitle(card);
-    // 必须先上锁再点击；即使新标签页打开很慢，下一轮也不会重复点击。
     state.waitingForPlayer = true;
     state.playerSeen = false;
     state.openingSince = Date.now();
@@ -426,7 +421,7 @@
       video.removeAttribute('autoplay');
       video.pause();
     } catch (error) {
-      log('停止完播视频时出现异常：', error);
+      log('停止完播视频异常：', error);
     }
   }
 
@@ -439,7 +434,7 @@
     state.completionEvidence = evidence;
     freezeFinishedVideo(video);
     log('锁定视频完播状态：', evidence);
-    updatePanel('视频已完播，等待网站保存进度…');
+    updatePanel('视频已完播，准备刷新页面…');
   }
 
   function observeVideo(video) {
@@ -447,7 +442,6 @@
     state.observedVideo = video;
     state.maxProgressRatio = 0;
     state.lastVideoTime = Number(video.currentTime) || 0;
-    // ended 事件可能只持续一瞬间；直接锁存，避免网站自动重播后丢失完播状态。
     video.addEventListener('ended', () => markPlayerFinished(video, 'video ended 事件'));
   }
 
@@ -455,18 +449,9 @@
     closePlayer(video);
     const tryClose = () => {
       freezeFinishedVideo(video);
-      try {
-        window.opener?.focus();
-      } catch (error) {
-        log('无法聚焦原课程列表页：', error);
-      }
-      try {
-        window.close();
-      } catch (error) {
-        log('自动关闭学习页失败：', error);
-      }
+      try { window.opener?.focus(); } catch (e) {}
+      try { window.close(); } catch (e) {}
     };
-    // 对脚本打开的标签页重复尝试关闭，兼容播放器销毁和页面事件的时间差。
     window.setTimeout(tryClose, 300);
     window.setTimeout(tryClose, 1200);
     window.setTimeout(tryClose, 2600);
@@ -478,10 +463,22 @@
 
     const video = getPlayableVideo();
     if (!video) {
+      // 检查视频加载是否超时（超过 10 秒找不到视频元素，判定为视频无法播放/卡顿，自动刷新重试）
+      if (!state.playerWaitStartTime) {
+        state.playerWaitStartTime = Date.now();
+      } else if (Date.now() - state.playerWaitStartTime > 10000) {
+        log('视频长时间无法加载，执行刷新重试。');
+        updatePanel('视频加载超时，正在刷新页面重试…');
+        window.setTimeout(() => location.reload(), 1000);
+        return;
+      }
       updatePanel('等待播放器加载…');
       clickPlayerPlay(document);
       return;
     }
+
+    // 找到视频后清空超时计时器
+    state.playerWaitStartTime = 0;
 
     observeVideo(video);
     if (CONFIG.startMuted) video.muted = true;
@@ -503,7 +500,6 @@
 
     if (completionEvidence) markPlayerFinished(video, completionEvidence);
 
-    // endedAt 一旦写入便不再清空：网站即使自动重播，也仍按已完播处理。
     if (state.endedAt) {
       freezeFinishedVideo(video);
       if (!state.completionSent && Date.now() - state.endedAt >= CONFIG.closeDelayMs) {
@@ -522,13 +518,8 @@
     const current = Math.floor(video.currentTime || 0);
     updatePanel(`正在播放（${current}/${duration || '?'} 秒）`);
     if (video.paused) {
-      // 优先点击网站播放器自身的播放键，确保播放器内部事件和学习进度上报正常触发。
       if (!clickPlayerPlay(playerScope(video))) {
-        try {
-          await video.play();
-        } catch (error) {
-          log('播放器按钮及 video.play() 均未成功：', error);
-        }
+        try { await video.play(); } catch (e) {}
       }
     }
   }
@@ -593,7 +584,6 @@
     }
 
     const cards = getCourseCards();
-    // 核心修复：列表为空绝不视为完成，也绝不切换分类。
     if (cards.length === 0) {
       state.completeScans = 0;
       updatePanel(`“${category}”课程列表尚未加载，继续等待…`);
@@ -609,7 +599,13 @@
       state.completeScans = 0;
       const next = summary.unfinished[0];
       updatePanel(`“${category}”：已完成 ${summary.complete.length}/${cards.length}，准备学习下一课。`);
-      openCourse(next);
+
+      // 每次在打开下一个视频前，先让当前列表页刷新一下，保证状态完全同步
+      if (openCourse(next)) {
+        window.setTimeout(() => {
+          try { location.reload(); } catch (e) {}
+        }, 1500);
+      }
       return;
     }
 
@@ -619,7 +615,6 @@
       return;
     }
 
-    // 所有真实视频卡片均为 status2 后，还要连续确认三次，防止 Vue 重绘空窗误判。
     if (Date.now() - state.lastCompleteScanAt >= CONFIG.completeConfirmIntervalMs) {
       state.completeScans += 1;
       state.lastCompleteScanAt = Date.now();
@@ -636,7 +631,8 @@
       else await listTick();
     } catch (error) {
       console.error('[保密网自动学习] 运行异常：', error);
-      updatePanel(`发生异常，稍后重试：${error?.message || error}`);
+      updatePanel(`发生异常，正在刷新页面重试…`);
+      window.setTimeout(() => location.reload(), 2000);
     } finally {
       schedule(CONFIG.tickMs);
     }
@@ -648,6 +644,11 @@
   }
 
   function boot() {
+    window.addEventListener('beforeunload', (event) => {
+      event.stopImmediatePropagation();
+    }, true);
+    window.onbeforeunload = null;
+
     try {
       injectPanel();
       initChannel();
